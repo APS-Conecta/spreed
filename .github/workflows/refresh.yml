@@ -1,0 +1,185 @@
+# The spreed fork's refresh (ADR-0020, instalador #145): upstream's newest stable release
+# for a Nextcloud major, proven against upstream's own checksums, repacked and signed as this
+# repo's App release — the suite installs Talk from here, never from the app store.
+#
+# This repo is a fork of nextcloud/spreed with ZERO code changes. The only things of ours are
+# under .github/: this workflow and the vendored resolver beside it
+# (.github/scripts/spreed-refresh.py, the byte-identical copy of instalador's
+# scripts/spreed-refresh.py — the canonical copy; instalador's release chain verifies this
+# repo's published release against its own resolver before a suite release exists). The app's
+# code is untouched, so upstream's AGPL attribution travels whole.
+#
+# Triggers:
+#   - instalador's release chain (repository_dispatch, event refresh-spreed) at each suite
+#     release: the dispatch carries the tag tree's Nextcloud major, and the suite's Release is
+#     not created until this refresh has landed and verified.
+#   - workflow_dispatch (the owner's one-shot — the first release, or a repair).
+#
+# What a refresh does, in order: the vendored resolver's own --self-test (hermetic, first — a
+# drifted copy reds before it publishes anything), then upstream's newest stable release for
+# the major resolved from the appstore record upstream itself publishes, downloaded and proven
+# against the release-asset digest GitHub publishes for exactly those bytes, repacked with
+# exactly one difference (appinfo/signature.json dropped — a release of ours never carries
+# one), and handed to the publish job. The publish job signs inside this repo's `release`
+# environment — the app key's only home (ADR-0001: the suite repo never sees it), proves the
+# signature against instalador's apps.pub, points the release's tag at upstream's own commit
+# (the fork's tag is upstream's tag — zero code changes, honest provenance), and publishes
+# exactly four assets: spreed.tar.gz, info.xml, SHA256SUMS, SHA256SUMS.minisig.
+#
+# Idempotent: a tag that already exists is verified and left alone — published assets never
+# move — so a suite release between two upstream releases costs nothing.
+#
+# WHAT THIS REPO NEEDS BEFORE ITS FIRST RUN (owner-only, once — same as every app repo):
+# a `release` environment carrying APP_SIGNING_KEY and APP_SIGNING_KEY_PASSWORD (the app key
+# apps.pub trusts), and Actions enabled. See instalador's aps/RELEASING.md.
+name: Refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      nextcloud-major:
+        description: "The suite's Nextcloud major (the tag tree's NEXTcloud_VERSION)."
+        required: true
+        default: "34"
+        type: string
+  repository_dispatch:
+    types: [refresh-spreed]
+
+permissions: {}
+
+jobs:
+  refresh:
+    name: Resolve, prove, repack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      MAJOR: ${{ github.event.client_payload.nextcloud_major || inputs.nextcloud-major || '34' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The major is a number — everything downstream reads it
+        run: |
+          [[ "$MAJOR" =~ ^[0-9]+$ ]] \
+            || { echo "::error::nextcloud-major must be a number, got '$MAJOR'"; exit 1; }
+          echo "refreshing upstream spreed for Nextcloud $MAJOR"
+      - name: The vendored resolver proves itself first (hermetic — no network)
+        run: python3 .github/scripts/spreed-refresh.py --self-test
+      - name: Resolve, prove against upstream's own checksum, repack
+        run: python3 .github/scripts/spreed-refresh.py refresh --nextcloud "$MAJOR" --out dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: app-release
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Sign and publish
+    needs: refresh
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write   # the release's tag and assets
+    env:
+      APP_ID: spreed
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out the packer at its pinned commit (the org's shared signing rules)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: APS-Conecta/.github
+          ref: 6fa99e34f7cf85b5b21c5d3c2c3efc8d53aa768a # 2026-10-24
+          path: tools
+          persist-credentials: false
+      - name: Check out apps.pub, the app key the installer trusts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: APS-Conecta/instalador
+          ref: main
+          path: suite
+          sparse-checkout: apps.pub
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Install signify
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y signify-openbsd
+          command -v signify >/dev/null || sudo ln -sf "$(command -v signify-openbsd)" /usr/local/bin/signify
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: app-release
+          path: dist
+      - name: The release this refresh publishes, read from the proven bytes
+        id: tag
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import xml.etree.ElementTree as E; print((E.parse("dist/info.xml").getroot().findtext("version") or "").strip())')"
+          [[ "v$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::dist/info.xml declares no dotted version ('$version') — the refresh would publish no honest tag"; exit 1; }
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+      - name: Already published? Verify it is whole, and touch nothing
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "no release at $TAG yet — publishing"
+            exit 0
+          fi
+          echo "release $TAG already exists — verifying it is whole (published assets never move)"
+          nombres="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          for esperado in "$APP_ID.tar.gz" info.xml SHA256SUMS SHA256SUMS.minisig; do
+            printf '%s\n' "$nombres" | grep -qxF "$esperado" \
+              || { echo "::error::release $TAG lacks $esperado — a published release is incomplete; repair by hand, never re-upload"; exit 1; }
+          done
+          rm -rf verify && mkdir verify && cd verify
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --clobber
+          signify -V -q -p ../suite/apps.pub -m SHA256SUMS -x SHA256SUMS.minisig \
+            || { echo "::error::the published signature does not verify against apps.pub"; exit 1; }
+          sha256sum -c --quiet SHA256SUMS
+          echo "verified: $TAG is whole and ours — nothing to do"
+          echo "ALREADY_PUBLISHED=1" >> "$GITHUB_ENV"
+      - name: Sign SHA256SUMS and prove it against apps.pub
+        if: env.ALREADY_PUBLISHED != '1'
+        env:
+          APP_SIGNING_KEY: ${{ secrets.APP_SIGNING_KEY }}
+          APP_SIGNING_KEY_PASSWORD: ${{ secrets.APP_SIGNING_KEY_PASSWORD }}
+        run: bash tools/scripts/pack-app.sh sign dist suite/apps.pub
+      - name: The tag is upstream's own commit — the fork's tree stays zero-change
+        if: env.ALREADY_PUBLISHED != '1'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # upstream's commit for this tag: nextcloud/spreed is the source of truth (the
+          # releases mirror nextcloud-releases/spreed carries the same history)
+          sha_upstream="$(gh api "repos/nextcloud/spreed/git/ref/tags/$TAG" --jq '.object.sha')"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            sha_nuestro="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')"
+            [ "$sha_nuestro" = "$sha_upstream" ] \
+              || { echo "::error::the fork's $TAG points at $sha_nuestro, upstream's at $sha_upstream — a moved tag is an incident, never something to re-point"; exit 1; }
+            echo "tag $TAG already at upstream's commit"
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$TAG" -f "sha=$sha_upstream" >/dev/null
+            echo "tag $TAG created at upstream's commit $sha_upstream"
+          fi
+      - name: Publish the release, latest only for the highest version
+        if: env.ALREADY_PUBLISHED != '1'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          top="$(gh api --paginate "repos/$GITHUB_REPOSITORY/tags" --jq '.[].name' \
+            | grep -E '^v[0-9]+(\.[0-9]+)+$' | sort -V | tail -n 1)"
+          latest=false; [ "$top" = "$TAG" ] && latest=true
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --latest="$latest" \
+            "dist/$APP_ID.tar.gz" dist/info.xml dist/SHA256SUMS dist/SHA256SUMS.minisig
+          echo "published $TAG ($latest) with the four assets"
